@@ -31,6 +31,8 @@ except ImportError:
     except ImportError:
         flash_attn_unpadded_func = None
 
+from megatron import get_stream
+
 """ We use the following notation throughout this file:
      h: hidden size
      n: number of attention heads
@@ -720,6 +722,329 @@ class ParallelAttention(MegatronModule):
         return output, bias
 
 
+class ParallelAttention1(MegatronModule):
+    """Parallel self-attention layer abstract class.
+
+    Self-attention layer takes input with size [s, b, h]
+    and returns output of the same size.
+    """
+
+    def __init__(self, config, layer_number,
+                 attention_type=AttnType.self_attn,
+                 attn_mask_type=AttnMaskType.padding):
+        super(ParallelAttention1, self).__init__()
+        args = get_args()
+        self.layer_number = max(1, layer_number)
+        self.attention_type = attention_type
+        self.attn_mask_type = attn_mask_type
+        self.params_dtype = config.params_dtype
+        self.sequence_parallel = config.sequence_parallel
+
+        self.group_query_attention = args.group_query_attention
+        self.num_query_groups = args.num_query_groups
+
+        query_projection_size = config.kv_channels * config.num_attention_heads
+        if self.group_query_attention:
+            kv_projection_size = args.kv_channels * args.num_query_groups
+        else:
+            kv_projection_size = args.kv_channels * args.num_attention_heads
+
+        self.use_flash_attn = args.use_flash_attn \
+            and attention_type == AttnType.self_attn \
+            and self.attn_mask_type == AttnMaskType.causal
+        if self.use_flash_attn:
+            if flash_attn_unpadded_func is None:
+                raise ImportError('FlashAttention is not installed, please install with '
+                                  'pip install flash-attn')
+            assert attention_type == AttnType.self_attn, ('FlashAttention code path only supports '
+                                                          'self-attention for now')
+            assert self.attn_mask_type == AttnMaskType.causal, ('FlashAttention code path only '
+                                                                'supports causal mask for now')
+            if rearrange is None:
+                raise ImportError('einops is not installed, please install with pip install einops')
+
+        # Per attention head and per partition values.
+        world_size = mpu.get_tensor_model_parallel_world_size()
+        self.hidden_size_per_attention_head = core.utils.divide(
+            query_projection_size, config.num_attention_heads)
+        self.num_attention_heads_per_partition = core.utils.divide(
+            config.num_attention_heads, world_size)
+
+        if self.group_query_attention:
+            if args.num_query_groups % world_size != 0:
+                raise NotImplementedError('Currently the num_query_groups should be '
+                                          'a multiple of the tensor parallel size')
+            self.num_query_groups_per_partition = core.utils.divide(
+                        args.num_query_groups, world_size)
+        else:
+            self.num_query_groups_per_partition = self.num_attention_heads_per_partition
+
+        # Strided linear layer.
+        if attention_type == AttnType.self_attn:
+            self.query_key_value = tensor_parallel.ColumnParallelLinear(
+                config.hidden_size,
+                query_projection_size + 2 * kv_projection_size,
+                config=config,
+                init_method=config.init_method,
+                bias=args.add_bias_linear,
+                gather_output=False)
+        else:
+            assert attention_type == AttnType.cross_attn
+
+            if self.group_query_attention:
+                raise NotImplementedError("Grouped query attention not implemented for cross-attention.")
+            assert query_projection_size == kv_projection_size
+
+            self.query = tensor_parallel.ColumnParallelLinear(
+                config.hidden_size,
+                query_projection_size,
+                config=config,
+                init_method=config.init_method,
+                bias=config.add_bias_linear,
+                gather_output=False)
+
+            self.key_value = tensor_parallel.ColumnParallelLinear(
+                config.hidden_size,
+                2 * kv_projection_size,
+                config=config,
+                init_method=config.init_method,
+                bias=config.add_bias_linear,
+                gather_output=False)
+
+        self.core_attention = CoreAttention(self.layer_number, config,
+                                            self.attn_mask_type)
+        self.checkpoint_core_attention = config.recompute_granularity == 'selective'
+
+        if self.use_flash_attn:
+            self.core_attention_flash = FlashSelfAttention(
+                causal=True, attention_dropout=config.attention_dropout
+            )
+
+        # Output.
+        self.dense = tensor_parallel.RowParallelLinear(
+            query_projection_size,
+            config.hidden_size,
+            config=config,
+            init_method=config.output_layer_init_method,
+            bias=args.add_bias_linear,
+            input_is_parallel=True,
+            skip_bias_add=True)
+
+    def _checkpointed_attention_forward(self, query_layer, key_layer,
+                                        value_layer, attention_mask,
+                                        rotary_pos_emb=None):
+        """Forward method with activation checkpointing."""
+        def custom_forward(*inputs):
+            query_layer = inputs[0]
+            key_layer = inputs[1]
+            value_layer = inputs[2]
+            attention_mask = inputs[3]
+            output_ = self.core_attention(query_layer, key_layer,
+                                          value_layer, attention_mask)
+            return output_
+
+        q_pos_emb, k_pos_emb = (None, None) if rotary_pos_emb is None \
+            else rotary_pos_emb
+
+        hidden_states = tensor_parallel.checkpoint(
+            custom_forward,
+            False, query_layer, key_layer, value_layer, attention_mask,
+            q_pos_emb, k_pos_emb)
+
+        return hidden_states
+
+    def _allocate_memory(self, inference_max_sequence_len, batch_size, num_attention_heads):
+        return torch.empty(
+            inference_max_sequence_len,
+            batch_size,
+            num_attention_heads,
+            self.hidden_size_per_attention_head,
+            dtype=self.params_dtype,
+            device=torch.cuda.current_device())
+
+    def forward(self, hidden_states, attention_mask,
+                encoder_output=None, inference_params=None,
+                rotary_pos_emb=None):
+        # hidden_states: [sq, b, h]
+
+        # =================================================
+        # Pre-allocate memory for key-values for inference.
+        # =================================================
+        is_first_step = False
+        if inference_params:
+            if self.layer_number not in inference_params.key_value_memory_dict:
+                inf_max_seq_len = inference_params.max_sequence_length
+                inf_max_batch_size = inference_params.max_batch_size
+                inference_key_memory = self._allocate_memory(
+                    inf_max_seq_len, inf_max_batch_size,
+                    self.num_query_groups_per_partition)
+                inference_value_memory = self._allocate_memory(
+                    inf_max_seq_len, inf_max_batch_size,
+                    self.num_query_groups_per_partition)
+
+                inference_params.key_value_memory_dict[self.layer_number] = (
+                    inference_key_memory, inference_value_memory)
+                is_first_step = True
+            else:
+                inference_key_memory, inference_value_memory = \
+                    inference_params.key_value_memory_dict[self.layer_number]
+
+        # =====================
+        # Query, Key, and Value
+        # =====================
+        if self.attention_type == AttnType.self_attn:
+
+            # Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
+            mixed_x_layer, _ = self.query_key_value(hidden_states)
+
+            # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
+            new_tensor_shape = mixed_x_layer.size()[:-1] + (
+                self.num_query_groups_per_partition,
+                (
+                    (self.num_attention_heads_per_partition // self.num_query_groups_per_partition + 2)
+                    * self.hidden_size_per_attention_head
+                ),
+            )
+            mixed_x_layer = mixed_x_layer.view(*new_tensor_shape)
+
+            # [sq, b, ng, (np/ng + 2) * hn] --> [sq, b, ng, np/ng * hn], [sq, b, ng, hn], [sq, b, ng, hn]
+            (query_layer,
+            key_layer,
+            value_layer) = torch.split(
+                mixed_x_layer,
+                [
+                    (
+                        self.num_attention_heads_per_partition // self.num_query_groups_per_partition
+                        * self.hidden_size_per_attention_head
+                    ),
+                    self.hidden_size_per_attention_head,
+                    self.hidden_size_per_attention_head
+                ],
+                dim=3)
+
+            # [sq, b, ng, np/ng * hn] -> [sq, b, np, hn] -
+            query_layer = query_layer.view(query_layer.size(0), query_layer.size(1), -1, self.hidden_size_per_attention_head)
+        else:
+            # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
+            mixed_kv_layer, _ = self.key_value(encoder_output)
+
+            # [sk, b, (np * 2 * hn)] --> [sk, b, np, 2 * hn]
+            new_tensor_shape = mixed_kv_layer.size()[:-1] + \
+                (self.num_attention_heads_per_partition,
+                2 * self.hidden_size_per_attention_head)
+            mixed_kv_layer = mixed_kv_layer.view(*new_tensor_shape)
+
+            # [sk, b, np, 2 * hn] --> 2 [sk, b, np, hn]
+            (key_layer,
+            value_layer) = tensor_parallel.split_tensor_along_last_dim(mixed_kv_layer, 2)
+
+            # Attention head [sq, b, h] --> [sq, b, hp]
+            query_layer, _ = self.query(hidden_states)
+            # [sq, b, hp] --> [sq, b, np, hn]
+            new_tensor_shape = query_layer.size()[:-1] + \
+                (self.num_attention_heads_per_partition,
+                self.hidden_size_per_attention_head)
+            query_layer = query_layer.view(*new_tensor_shape)
+
+        # ==================================
+        # Adjust key and value for inference
+        # ==================================
+
+        # duplicate the pos_emb for self attention
+        if rotary_pos_emb is not None:
+            if isinstance(rotary_pos_emb, tuple):
+                rotary_pos_emb = rotary_pos_emb
+            else:
+                rotary_pos_emb = ((rotary_pos_emb,) * 2)
+
+        if inference_params:
+            batch_start = inference_params.batch_size_offset
+            batch_end = batch_start + key_layer.size(1)
+            assert batch_end <= inference_key_memory.size(1)
+            sequence_start = inference_params.sequence_len_offset
+            sequence_end = sequence_start + key_layer.size(0)
+            assert sequence_end <= inference_key_memory.size(0)
+            # Copy key and values.
+            inference_key_memory[sequence_start:sequence_end,
+                                 batch_start:batch_end, ...] = key_layer
+            inference_value_memory[sequence_start:sequence_end,
+                                   batch_start:batch_end, ...] = value_layer
+            key_layer = inference_key_memory[
+                :sequence_end, batch_start:batch_end, ...]
+            value_layer = inference_value_memory[
+                :sequence_end, batch_start:batch_end, ...]
+
+
+            # adjust the key rotary positional embedding
+            if rotary_pos_emb is not None:
+                q_pos_emb, k_pos_emb = rotary_pos_emb
+                # need to cross check this condition during inference
+                # if not set_inference_key_value_memory:
+                if not is_first_step:
+                    # In inference, we compute one token at a time.
+                    # Select the correct positional embedding
+                    # (only the last token in the sequence)
+                    q_pos_emb = q_pos_emb[sequence_end - 1 : sequence_end]
+                else:
+                    # In the first forward pass of inference,
+                    # we use the entire provided prefix.
+                    # q_pos_emb here has the rope embeddings of the entire
+                    # prefix + to-be-generated output so
+                    # we slice to just the prefix.
+                    q_pos_emb = q_pos_emb[:sequence_end, :, :, :]
+                k_pos_emb = k_pos_emb[:sequence_end, :, :, :]
+                rotary_pos_emb = (q_pos_emb, k_pos_emb)
+
+        # ==================================
+        # core attention computation
+        # ==================================
+
+        # expand the key_layer and value_layer [sk, b, ng, hn] -> [sk, b, np, hn]
+        key_layer = key_layer.repeat_interleave(
+            self.num_attention_heads_per_partition // self.num_query_groups_per_partition,
+            dim = 2
+        )
+        value_layer = value_layer.repeat_interleave(
+            self.num_attention_heads_per_partition // self.num_query_groups_per_partition,
+            dim = 2
+        )
+
+        # apply relative positional encoding (rotary embedding)
+        if rotary_pos_emb is not None:
+            q_pos_emb, k_pos_emb = rotary_pos_emb
+            query_layer = apply_rotary_pos_emb(query_layer, q_pos_emb)
+            key_layer = apply_rotary_pos_emb(key_layer, k_pos_emb)
+            # TODO, can apply positional embedding to value_layer so it has
+            # absolute positional embedding.
+            # otherwise, only relative positional embedding takes effect
+            # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
+
+        if not self.use_flash_attn:
+            if self.checkpoint_core_attention:
+                context_layer = self._checkpointed_attention_forward(
+                    query_layer, key_layer, value_layer, attention_mask)
+            else:
+                context_layer = self.core_attention(
+                    query_layer, key_layer, value_layer, attention_mask)
+        else:
+            q, k, v = [rearrange(x, 's b ... -> b s ...').contiguous()
+                       for x in (query_layer, key_layer, value_layer)]
+            if not self.sequence_parallel:
+                with tensor_parallel.get_cuda_rng_tracker().fork():
+                    context_layer = self.core_attention_flash(q, k, v)
+            else:
+                context_layer = self.core_attention_flash(q, k, v)
+            context_layer = rearrange(context_layer, 'b s h d -> s b (h d)').contiguous()
+
+        # =================
+        # Output. [sq, b, h]
+        # =================
+
+        output, bias = self.dense(context_layer)
+
+        return output, bias
+
+
 def bias_dropout_add(x, bias, residual, prob, training):
     # type: (Tensor, Optional[Tensor], Tensor, float, bool) -> Tensor
     if bias is not None:
@@ -779,14 +1104,19 @@ class ParallelTransformerLayer(MegatronModule):
         self.input_norm = get_norm(config)
 
         # Self attention.
-        self.self_attention = ParallelAttention(
-            config,
-            layer_number,
-            attention_type=AttnType.self_attn,
-            attn_mask_type=self_attn_mask_type)
+        # self.self_attention = ParallelAttention(
+        #     config,
+        #     layer_number,
+        #     attention_type=AttnType.self_attn,
+        #     attn_mask_type=self_attn_mask_type)
+
         self.hidden_dropout = config.hidden_dropout
         self.bias_dropout_fusion = config.bias_dropout_fusion
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else None
+
+        self.intra_partitions = 2
+        self.p_self_attention = torch.nn.ModuleList(
+            ParallelAttention1(config, layer_number, attention_type=AttnType.self_attn, attn_mask_type=self_attn_mask_type) for i in range(self.intra_partitions))
 
         # Normalize the attention output
         self.post_attention_norm = get_norm(config)
@@ -1053,12 +1383,68 @@ class ParallelTransformerLayer(MegatronModule):
         norm_output = self.input_norm(hidden_states)
 
         # Self attention.
-        attention_output, attention_bias = \
-            self.self_attention(
-                norm_output,
-                attention_mask,
-                inference_params=inference_params,
-                rotary_pos_emb=rotary_pos_emb)
+        # attention_output, attention_bias = \
+        #     self.self_attention(
+        #         norm_output,
+        #         attention_mask,
+        #         inference_params=inference_params,
+        #         rotary_pos_emb=rotary_pos_emb)
+
+        # Self attention.
+        norm_output = tensor_parallel.copy_to_tensor_model_parallel_region(norm_output)
+
+        p_attention_outputs = []
+        p_attention_biases = []
+        attn_out_size = list(norm_output.size())
+        dtype = norm_output.dtype
+        batch_per_p = attn_out_size[1] // self.intra_partitions
+
+        # dim_per_p = attn_out_size[-1] // self.intra_partitions
+        # attn_out_size[-1] = dim_per_p
+        # attn_out_size.append(2)
+        # attn_bias_size = [attn_out_size[-2], 2]
+
+        # attention_output = torch.empty(attn_out_size, dtype=dtype, device=torch.cuda.current_device())
+        # attention_bias = torch.empty(attn_bias_size, dtype=dtype, device=torch.cuda.current_device())
+        # attention_output = torch.zeros(attn_out_size, dtype=dtype, device=torch.cuda.current_device())
+        # attention_bias = torch.zeros(attn_bias_size, dtype=dtype, device=torch.cuda.current_device())
+
+        # attention_output1 = torch.zeros(attn_out_size, dtype=dtype, device=torch.cuda.current_device())
+        # attention_bias1 = torch.zeros(attn_bias_size, dtype=dtype, device=torch.cuda.current_device())
+
+        # attention_output0 = torch.narrow(attention_output, 2, 0, dim_per_p)
+        # attention_output1 = torch.narrow(attention_output, 2, dim_per_p, dim_per_p)
+        # attention_bias0 = torch.narrow(attention_bias, 0, 0, dim_per_p)
+        # attention_bias1 = torch.narrow(attention_bias, 0, dim_per_p, dim_per_p)
+
+        norm_outputs = []
+        for i in range(self.intra_partitions):
+            norm_outputs.append(torch.narrow(norm_output, 1, i*batch_per_p, batch_per_p))
+            # norm_outputs.append(norm_output[:, batch_per_p*i:batch_per_p*(i+1), :])
+
+        # Self attention.
+        for i in range(self.intra_partitions):
+            s_idx = i % 4
+            current_stream = get_stream(s_idx)
+            with torch.cuda.stream(current_stream):
+            # if True:
+                p_attention_output, p_attention_bias = \
+                    self.p_self_attention[i](
+                        norm_outputs[i],
+                        attention_mask,
+                        inference_params=inference_params,
+                        rotary_pos_emb=rotary_pos_emb)
+                
+                # attention_output1[..., i] = p_attention_output
+                # attention_bias1[..., i] = p_attention_bias
+                p_attention_outputs.append(p_attention_output)
+                p_attention_biases.append(p_attention_bias)
+
+        # attention_output = attention_output1.flatten(2, 3)
+        # attention_bias = attention_bias1.flatten(0, 1)
+        
+        attention_output = torch.cat(p_attention_outputs, dim=1)
+        attention_bias = torch.stack(p_attention_biases).sum(dim=0)
 
         # Residual connection.
         if self.apply_residual_connection_post_norm:
